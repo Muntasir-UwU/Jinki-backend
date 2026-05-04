@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: jinki-backend
+    runtime: python
+    region: singapore          # closest to BD/IN — change if needed
+    plan: free
+
+    buildCommand: |
+      pip install -r requirements.txt
+
+    startCommand: |
+      daphne -b 0.0.0.0 -p $PORT jinki_backend.asgi:application
+
+    envVars:
+      - key: DJANGO_SETTINGS_MODULE
+        value: jinki_backend.settings
+      - key: DJANGO_SECRET_KEY
+        generateValue: true        # Render generates a random secret
+      - key: ALLOWED_HOSTS
+        value: jinki-backend.onrender.com
+      - key: DEBUG
+        value: false
+      # Uncomment if you add a Redis instance:
+      # - key: REDIS_URL
+      #   fromService:
+      #     type: redis
+      #     name: jinki-redis
+      #     property: connectionString
