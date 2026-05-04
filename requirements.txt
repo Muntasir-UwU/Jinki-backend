@@ -1,0 +1,16 @@
+# Core
+django>=4.2,<5.2
+channels[daphne]>=4.1
+channels-redis>=4.2
+
+# Redis (sync for views + async for consumers)
+redis>=5.0
+
+# HTTP client for self-ping background task
+aiohttp>=3.9
+
+# CORS headers for /health/ and other HTTP routes
+django-cors-headers>=4.3
+
+# .env file support
+python-dotenv>=1.0
