@@ -1,81 +1,79 @@
+"""
+jinki_backend/settings.py
+Django + Channels settings for the Jinka Couple Sync backend.
+"""
 import os
 from pathlib import Path
-from dotenv import load_dotenv
-
-# Load environment variables from .env file if it exists
-load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# ── Security ────────────────────────────────────────────────────────────────
-# We pull the ALLOWED_HOSTS from the environment. 
-# If not found, we use a safe default that includes your Render domain.
-_allowed_hosts_env = os.environ.get(
-    "ALLOWED_HOSTS", 
-    "jinki-backend.onrender.com,localhost,127.0.0.1"
-)
-ALLOWED_HOSTS = [h.strip() for h in _allowed_hosts_env.split(",") if h.strip()]
-
+# ── Security ──────────────────────────────────────────────────────────────────
 SECRET_KEY = os.environ.get(
-    "DJANGO_SECRET_KEY", "insecure-dev-key-replace-in-production"
+    'DJANGO_SECRET_KEY',
+    'changeme-use-a-real-secret-in-production-please'
 )
+DEBUG = os.environ.get('DEBUG', 'false').lower() == 'true'
 
-# Debug should be False in production (Render), True locally
-DEBUG = os.environ.get("DEBUG", "True") == "True"
+ALLOWED_HOSTS = os.environ.get(
+    'ALLOWED_HOSTS',
+    'localhost 127.0.0.1 jinki-backend.onrender.com'
+).split()
 
-# ── Apps ────────────────────────────────────────────────────────────────────
+# ── Apps ──────────────────────────────────────────────────────────────────────
 INSTALLED_APPS = [
-    "django.contrib.contenttypes",
-    "django.contrib.staticfiles",
-    "corsheaders",
-    "channels",
-    "sync.apps.SyncConfig",
+    'daphne',               # must be first so it owns the runserver command
+    'django.contrib.staticfiles',
+    'channels',
+    'sync',                 # our WebSocket app
 ]
 
+# ── Middleware ────────────────────────────────────────────────────────────────
 MIDDLEWARE = [
-    "corsheaders.middleware.CorsMiddleware",
-    "django.middleware.common.CommonMiddleware",
+    'django.middleware.security.SecurityMiddleware',
+    'django.middleware.common.CommonMiddleware',
 ]
 
-# ── CORS / CSRF ──────────────────────────────────────────────────────────────
-# Important for allowing your GitHub Pages frontend to talk to this backend
-_cors_env = os.environ.get(
-    "CORS_ALLOWED_ORIGINS",
-    "https://muntasir-uwu.github.io,http://localhost:8000,http://127.0.0.1:8000",
-)
-CORS_ALLOWED_ORIGINS = [o.strip() for o in _cors_env.split(",") if o.strip()]
-CSRF_TRUSTED_ORIGINS = CORS_ALLOWED_ORIGINS[:]
-CORS_ALLOW_CREDENTIALS = True
+ROOT_URLCONF = 'jinki_backend.urls'
 
-# ── URLs / ASGI ──────────────────────────────────────────────────────────────
-ROOT_URLCONF = "jinka_backend.urls"
-ASGI_APPLICATION = "jinka_backend.asgi.application"
+# ── Static files ──────────────────────────────────────────────────────────────
+STATIC_URL = '/static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
 
-# ── Redis / Channels ─────────────────────────────────────────────────────────
-# This connects your WebSocket logic to the Render Redis instance
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
+# ── ASGI / Channels ──────────────────────────────────────────────────────────
+ASGI_APPLICATION = 'jinki_backend.asgi.application'
 
-CHANNEL_LAYERS = {
-    "default": {
-        "BACKEND": "channels_redis.core.RedisChannelLayer",
-        "CONFIG": {
-            "hosts": [REDIS_URL],
-        },
+# Redis channel layer — falls back to in-memory if REDIS_URL is not set.
+# In-memory layer works fine for a single-dyno Render deploy.
+_REDIS_URL = os.environ.get('REDIS_URL', '')
+
+if _REDIS_URL:
+    CHANNEL_LAYERS = {
+        'default': {
+            'BACKEND': 'channels_redis.core.RedisChannelLayer',
+            'CONFIG': {
+                'hosts': [_REDIS_URL],
+                # Keep messages small — each sync event is < 512 bytes
+                'capacity': 100,
+                'expiry': 5,
+            },
+        }
     }
+else:
+    # Zero-dependency fallback: works on Render free tier without Redis add-on
+    CHANNEL_LAYERS = {
+        'default': {
+            'BACKEND': 'channels.layers.InMemoryChannelLayer',
+        }
+    }
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {'console': {'class': 'logging.StreamHandler'}},
+    'root': {'handlers': ['console'], 'level': 'INFO'},
 }
 
-# ── Database ─────────────────────────────────────────────────────────────────
-# SQLite is fine for small sync projects without persistent users
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
-    }
-}
-
-# ── Misc ─────────────────────────────────────────────────────────────────────
-STATIC_URL = "/static/"
-DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
-
-# Optional: Self-ping setting to keep the service awake
-SELF_PING_URL = os.environ.get("SELF_PING_URL", "")
+# ── Internationalisation (minimal) ────────────────────────────────────────────
+USE_TZ = True
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
