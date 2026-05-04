@@ -9,7 +9,7 @@ services:
       pip install -r requirements.txt
 
     startCommand: |
-      daphne -b 0.0.0.0 -p $PORT jinki_backend.asgi:application
+      daphne -b 0.0.0.0 -p $PORT jinki-backend.asgi:application
 
     envVars:
       - key: DJANGO_SETTINGS_MODULE
