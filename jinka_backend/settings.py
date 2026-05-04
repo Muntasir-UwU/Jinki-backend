@@ -33,14 +33,14 @@ MIDDLEWARE = [
     'django.middleware.common.CommonMiddleware',
 ]
 
-ROOT_URLCONF = 'jinki_backend.urls'
+ROOT_URLCONF = 'jinka_backend.urls'
 
 # ── Static files ──────────────────────────────────────────────────────────────
 STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 # ── ASGI / Channels ──────────────────────────────────────────────────────────
-ASGI_APPLICATION = 'jinki_backend.asgi.application'
+ASGI_APPLICATION = 'jinka_backend.asgi.application'
 
 # Redis channel layer — falls back to in-memory if REDIS_URL is not set.
 # In-memory layer works fine for a single-dyno Render deploy.
