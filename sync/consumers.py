@@ -1,390 +1,184 @@
 """
-consumers.py — Jinka real-time music sync
-==========================================
+sync/consumers.py
+────────────────────────────────────────────────────────────────────
+JinkaSyncConsumer  —  WebSocket relay for the Jinka Couple Sync feature.
 
-WebSocket URL:  ws://<host>/ws/jinka/?user=<name>
-Room:           jinka_room  (hardcoded, private two-person room)
+Protocol (mirrors what the frontend already sends/expects):
+────────────────────────────────────────────────────────────────────
+Client → Server (all messages):
+  { type, user, ...payload }
 
-Redis keys
-----------
-jinka:sync_state        JSON: {trackIdx, currentTime, isPlaying, lastUpdatedAt}
-jinka:presence:<name>   float: Unix timestamp of last heartbeat  (TTL 200 s)
-jinka:conn_count        int:   currently connected WebSocket clients
+Server → all OTHER clients in the room:
+  Same JSON object, verbatim relay — the server never mutates payloads.
+
+Message types the frontend produces:
+  presence  { status: 'online' | 'offline', user }
+  state     { trackIdx, trackTitle, currentTime, isPlaying, user }
+  play      { time, user }
+  pause     { time, user }
+  seek      { time, user }
+  track     { trackIdx, trackTitle, user }
+
+The server additionally injects:
+  connected { type:'connected', user, room, peers:[...usernames] }
+    → sent only to the joining client on open
+  peer_left { type:'peer_left', user }
+    → sent to remaining clients when someone disconnects
+────────────────────────────────────────────────────────────────────
+Room strategy:
+  Everyone shares one room: JINKA_ROOM = 'jinka-couple'
+  This is intentional — Billi & Muntasir are the only users.
+  A simple ?room= param extension is included if you ever want
+  per-couple isolation.
+────────────────────────────────────────────────────────────────────
 """
-
-import asyncio
 import json
 import logging
-import time
-from urllib.parse import parse_qs, unquote
 
-import aiohttp
-import redis.asyncio as aioredis
 from channels.generic.websocket import AsyncWebsocketConsumer
-from django.conf import settings
 
 logger = logging.getLogger(__name__)
 
-# ── Constants ────────────────────────────────────────────────────────────────
-ROOM_GROUP = "jinka_room"
+# Default shared room — matches SYNC_ROOM constant in frontend
+JINKA_ROOM = 'jinka-couple'
 
-AWAY_TIMEOUT = 35       # seconds since last heartbeat → status "away"
-OFFLINE_TIMEOUT = 90    # seconds since last heartbeat → status "offline"
-DRIFT_INTERVAL = 30     # seconds between periodic sync_state broadcasts
-PING_INTERVAL = 600     # 10 min self-ping to keep free-tier dyno alive
-PRESENCE_TTL = 200      # Redis key TTL for presence records (generous buffer)
-
-SYNC_STATE_KEY = "jinka:sync_state"
-PRESENCE_KEY_PREFIX = "jinka:presence:"
-CONN_COUNT_KEY = "jinka:conn_count"
-
-# ── Module-level singletons ──────────────────────────────────────────────────
-_redis_client: aioredis.Redis | None = None
-_drift_task: asyncio.Task | None = None
-_ping_task: asyncio.Task | None = None
+# Registry of connected users per room: { room: { channel_name: username } }
+# This lives in process memory.  For a single Daphne worker (Render free tier)
+# this is perfectly fine.  If you scale to multiple workers, replace with
+# a Redis-backed solution (see bottom of file for the stub).
+_rooms: dict[str, dict[str, str]] = {}
 
 
-def _get_redis() -> aioredis.Redis:
-    """Return (and lazily create) the shared async Redis client."""
-    global _redis_client
-    if _redis_client is None:
-        _redis_client = aioredis.from_url(
-            settings.REDIS_URL,
-            encoding="utf-8",
-            decode_responses=True,
-            max_connections=20,
-        )
-    return _redis_client
-
-
-# ── Background tasks (module-level, shared across all consumer instances) ────
-
-async def _drift_broadcaster():
+class JinkaSyncConsumer(AsyncWebsocketConsumer):
     """
-    Every DRIFT_INTERVAL seconds, send the current sync_state to every
-    connected client so they can self-correct minor playback drift.
-    Runs as long as the process is alive; skips beats when nobody is online.
-    """
-    from channels.layers import get_channel_layer
-
-    channel_layer = get_channel_layer()
-    redis = _get_redis()
-
-    logger.info("Drift broadcaster started.")
-    try:
-        while True:
-            await asyncio.sleep(DRIFT_INTERVAL)
-
-            count_raw = await redis.get(CONN_COUNT_KEY)
-            if not count_raw or int(count_raw) < 1:
-                continue  # nobody home — skip this beat
-
-            raw = await redis.get(SYNC_STATE_KEY)
-            if not raw:
-                continue
-
-            state = json.loads(raw)
-            now = time.time()
-            current_time = _corrected_time(state, now)
-
-            await channel_layer.group_send(
-                ROOM_GROUP,
-                {
-                    "type": "send_json_to_client",
-                    "data": {
-                        "type": "sync_state",
-                        "trackIdx": state.get("trackIdx", 0),
-                        "currentTime": round(current_time, 3),
-                        "isPlaying": state.get("isPlaying", False),
-                        "timestamp": now,
-                    },
-                },
-            )
-    except asyncio.CancelledError:
-        logger.info("Drift broadcaster stopped.")
-    except Exception:
-        logger.exception("Drift broadcaster crashed — will restart on next connect.")
-
-
-async def _self_pinger():
-    """
-    GET /health/ every PING_INTERVAL seconds so the free-tier dyno never idles.
-    Only runs when SELF_PING_URL is set in the environment.
-    """
-    url = getattr(settings, "SELF_PING_URL", "").rstrip("/")
-    if not url:
-        logger.info("SELF_PING_URL not set — self-ping disabled.")
-        return
-
-    logger.info("Self-pinger started → %s/health/", url)
-    try:
-        while True:
-            await asyncio.sleep(PING_INTERVAL)
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        f"{url}/health/",
-                        timeout=aiohttp.ClientTimeout(total=15),
-                    ) as resp:
-                        logger.info("Self-ping → %s  status=%s", f"{url}/health/", resp.status)
-            except Exception as exc:
-                logger.warning("Self-ping failed: %s", exc)
-    except asyncio.CancelledError:
-        logger.info("Self-pinger stopped.")
-
-
-async def _ensure_background_tasks():
-    """Start drift broadcaster and self-pinger if they aren't already running."""
-    global _drift_task, _ping_task
-
-    if _drift_task is None or _drift_task.done():
-        _drift_task = asyncio.create_task(_drift_broadcaster())
-
-    if _ping_task is None or _ping_task.done():
-        _ping_task = asyncio.create_task(_self_pinger())
-
-
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-def _corrected_time(state: dict, now: float) -> float:
-    """
-    If the track was playing, add elapsed time since the state was last saved.
-    This gives a late-joiner the time-corrected position.
-    """
-    ct = state.get("currentTime", 0.0)
-    if state.get("isPlaying"):
-        ct += now - state.get("lastUpdatedAt", now)
-    return max(0.0, ct)
-
-
-# ── Consumer ─────────────────────────────────────────────────────────────────
-
-class JinkaConsumer(AsyncWebsocketConsumer):
-    """
-    One instance per WebSocket connection.
-
-    Query-string param:  ?user=<name>   (e.g. ws://host/ws/jinka/?user=Billi)
-    If omitted, a short anonymous ID is assigned.
+    One instance per connected WebSocket client.
     """
 
-    # ── Lifecycle ────────────────────────────────────────────────────────────
+    # ── Lifecycle ──────────────────────────────────────────────────────────
 
     async def connect(self):
-        # Parse username from query string
-        qs = self.scope.get("query_string", b"").decode("utf-8")
-        params = parse_qs(qs)
-        raw_name = params.get("user", [None])[0]
-        self.username: str = unquote(raw_name) if raw_name else f"anon_{id(self) % 9999}"
+        qs   = self.scope.get('query_string', b'').decode()
+        params = _parse_qs(qs)
 
-        await self.channel_layer.group_add(ROOM_GROUP, self.channel_name)
+        self.username = params.get('user', 'unknown')[:32]  # cap at 32 chars
+        self.room     = params.get('room', JINKA_ROOM)[:64]
+
+        # Join the channel layer group for this room
+        await self.channel_layer.group_add(self.room, self.channel_name)
+
+        # Register in local room registry
+        _rooms.setdefault(self.room, {})[self.channel_name] = self.username
+
         await self.accept()
 
-        redis = _get_redis()
-        await redis.incr(CONN_COUNT_KEY)
+        # Tell this client who else is already in the room
+        peers = [
+            name for ch, name in _rooms[self.room].items()
+            if ch != self.channel_name
+        ]
+        await self.send(json.dumps({
+            'type':  'connected',
+            'user':  self.username,
+            'room':  self.room,
+            'peers': peers,
+        }))
 
-        # Record heartbeat so presence monitor starts fresh
-        await self._touch_presence()
-
-        # Tell the room this user is online
-        await self._broadcast_presence("online")
-
-        # Send the late-joiner the time-corrected sync state immediately
-        await self._push_sync_state_to_self()
-
-        # Kick off shared background tasks
-        await _ensure_background_tasks()
-
-        # Per-connection presence watchdog
-        self._presence_status = "online"
-        self._presence_task: asyncio.Task = asyncio.create_task(
-            self._presence_watchdog()
-        )
-
-        logger.info("CONNECT  user=%s  channel=%s", self.username, self.channel_name)
+        logger.info('CONNECT  room=%s user=%s peers=%s',
+                    self.room, self.username, peers)
 
     async def disconnect(self, close_code):
-        logger.info(
-            "DISCONNECT  user=%s  channel=%s  code=%s",
-            self.username, self.channel_name, close_code,
+        # Remove from room registry
+        room_map = _rooms.get(self.room, {})
+        room_map.pop(self.channel_name, None)
+
+        # Notify remaining clients
+        await self.channel_layer.group_send(
+            self.room,
+            {
+                'type':        'relay',          # maps to self.relay()
+                'payload':     json.dumps({
+                    'type': 'peer_left',
+                    'user': self.username,
+                }),
+                'sender':      self.channel_name,
+            }
         )
 
-        # Cancel watchdog first
-        if hasattr(self, "_presence_task"):
-            self._presence_task.cancel()
-            try:
-                await self._presence_task
-            except asyncio.CancelledError:
-                pass
+        # Leave the group
+        await self.channel_layer.group_discard(self.room, self.channel_name)
 
-        redis = _get_redis()
-        await redis.decr(CONN_COUNT_KEY)
-        await redis.delete(f"{PRESENCE_KEY_PREFIX}{self.username}")
+        logger.info('DISCONNECT room=%s user=%s code=%s',
+                    self.room, self.username, close_code)
 
-        await self._broadcast_presence("offline")
-        await self.channel_layer.group_discard(ROOM_GROUP, self.channel_name)
+    # ── Receive from client ────────────────────────────────────────────────
 
-    async def receive(self, text_data: str):
-        try:
-            data: dict = json.loads(text_data)
-        except json.JSONDecodeError:
+    async def receive(self, text_data=None, bytes_data=None):
+        if not text_data:
             return
 
-        msg_type = data.get("type")
-        logger.debug("RECV  user=%s  type=%s", self.username, msg_type)
-
-        if msg_type == "heartbeat":
-            await self._touch_presence()
-            # Recover to "online" if the user had drifted to away
-            if self._presence_status != "online":
-                self._presence_status = "online"
-                await self._broadcast_presence("online")
-
-        elif msg_type in ("play", "pause", "seek", "track"):
-            await self._update_sync_state(data)
-
-            # Relay to the other user — NOT back to the sender
-            await self.channel_layer.group_send(
-                ROOM_GROUP,
-                {
-                    "type": "relay_to_partner",
-                    "data": data,
-                    "sender_channel": self.channel_name,
-                },
-            )
-
-    # ── Channel-layer message handlers ───────────────────────────────────────
-
-    async def relay_to_partner(self, event: dict):
-        """Forward play/pause/seek/track — skip the sender."""
-        if event["sender_channel"] != self.channel_name:
-            await self.send(text_data=json.dumps(event["data"]))
-
-    async def send_json_to_client(self, event: dict):
-        """Generic handler for sync_state and presence broadcasts."""
-        await self.send(text_data=json.dumps(event["data"]))
-
-    # ── Sync state ───────────────────────────────────────────────────────────
-
-    async def _push_sync_state_to_self(self):
-        """Send the current (time-corrected) sync state to this connection only."""
-        redis = _get_redis()
-        raw = await redis.get(SYNC_STATE_KEY)
-        if not raw:
-            return  # nobody has played anything yet
-
-        state = json.loads(raw)
-        now = time.time()
-
-        await self.send(
-            text_data=json.dumps(
-                {
-                    "type": "sync_state",
-                    "trackIdx": state.get("trackIdx", 0),
-                    "currentTime": round(_corrected_time(state, now), 3),
-                    "isPlaying": state.get("isPlaying", False),
-                    "timestamp": now,
-                }
-            )
-        )
-
-    async def _update_sync_state(self, data: dict):
-        """
-        Merge an incoming play/pause/seek/track message into the Redis sync state.
-        Always stamps lastUpdatedAt with the server's current time.
-        """
-        redis = _get_redis()
-        raw = await redis.get(SYNC_STATE_KEY)
-        state: dict = (
-            json.loads(raw)
-            if raw
-            else {"trackIdx": 0, "currentTime": 0.0, "isPlaying": False}
-        )
-
-        msg_type = data["type"]
-
-        if msg_type == "play":
-            state["isPlaying"] = True
-            state["currentTime"] = data.get("currentTime", state["currentTime"])
-            if "trackIdx" in data:
-                state["trackIdx"] = data["trackIdx"]
-
-        elif msg_type == "pause":
-            state["isPlaying"] = False
-            state["currentTime"] = data.get("currentTime", state["currentTime"])
-
-        elif msg_type == "seek":
-            # Preserve isPlaying; just update position
-            state["currentTime"] = data.get("currentTime", state["currentTime"])
-
-        elif msg_type == "track":
-            state["trackIdx"] = data.get("trackIdx", state["trackIdx"])
-            state["currentTime"] = 0.0
-            state["isPlaying"] = False
-
-        state["lastUpdatedAt"] = time.time()
-        await redis.set(SYNC_STATE_KEY, json.dumps(state))
-
-    # ── Presence ─────────────────────────────────────────────────────────────
-
-    async def _touch_presence(self):
-        """Stamp the current Unix time as this user's last-seen timestamp."""
-        redis = _get_redis()
-        await redis.set(
-            f"{PRESENCE_KEY_PREFIX}{self.username}",
-            time.time(),
-            ex=PRESENCE_TTL,
-        )
-
-    async def _broadcast_presence(self, status: str):
-        """Broadcast a presence update for this user to the whole room."""
-        await self.channel_layer.group_send(
-            ROOM_GROUP,
-            {
-                "type": "send_json_to_client",
-                "data": {
-                    "type": "presence",
-                    "user": self.username,
-                    "status": status,
-                },
-            },
-        )
-
-    async def _presence_watchdog(self):
-        """
-        Per-connection background task.
-        Polls Redis every 5 seconds; fires status transitions:
-            online  →  away    (after AWAY_TIMEOUT seconds without heartbeat)
-            away    →  offline (after OFFLINE_TIMEOUT seconds without heartbeat)
-
-        The WebSocket itself stays open — away/offline just means the other
-        user sees the partner has left the tab idle.
-        """
-        redis = _get_redis()
+        # Validate JSON — drop malformed messages silently
         try:
-            while True:
-                await asyncio.sleep(5)
+            parsed = json.loads(text_data)
+        except (json.JSONDecodeError, ValueError):
+            logger.warning('Malformed JSON from %s: %r', self.username, text_data[:120])
+            return
 
-                raw = await redis.get(f"{PRESENCE_KEY_PREFIX}{self.username}")
-                if raw is None:
-                    new_status = "offline"
-                else:
-                    elapsed = time.time() - float(raw)
-                    if elapsed >= OFFLINE_TIMEOUT:
-                        new_status = "offline"
-                    elif elapsed >= AWAY_TIMEOUT:
-                        new_status = "away"
-                    else:
-                        new_status = "online"
+        # Enforce that 'user' field matches the handshake username
+        # (prevents one client from spoofing another's name)
+        parsed['user'] = self.username
 
-                if new_status != self._presence_status:
-                    logger.info(
-                        "PRESENCE  user=%s  %s → %s",
-                        self.username, self._presence_status, new_status,
-                    )
-                    self._presence_status = new_status
-                    await self._broadcast_presence(new_status)
+        msg_type = parsed.get('type', '')
+        logger.debug('MSG  room=%s user=%s type=%s', self.room, self.username, msg_type)
 
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.exception("Presence watchdog crashed for user=%s", self.username)
+        # Relay to all OTHER clients in the room
+        await self.channel_layer.group_send(
+            self.room,
+            {
+                'type':    'relay',
+                'payload': json.dumps(parsed),
+                'sender':  self.channel_name,
+            }
+        )
+
+    # ── Channel layer handler ──────────────────────────────────────────────
+
+    async def relay(self, event):
+        """Called on every group_send; forwards payload to this WS client,
+        EXCEPT if this client was the original sender (echo prevention)."""
+        if event.get('sender') == self.channel_name:
+            return
+        await self.send(text_data=event['payload'])
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _parse_qs(qs: str) -> dict[str, str]:
+    """Minimal query-string parser — returns first value for each key."""
+    result: dict[str, str] = {}
+    for part in qs.split('&'):
+        if '=' in part:
+            k, _, v = part.partition('=')
+            result[k] = v
+    return result
+
+
+# ── Redis-backed room registry stub (for multi-worker scaling) ───────────────
+#
+# If you ever add more Daphne workers or use Gunicorn with multiple processes,
+# the in-memory _rooms dict will diverge between workers.  Replace it with:
+#
+#   import aioredis
+#   redis = aioredis.from_url(os.environ['REDIS_URL'])
+#
+#   async def _add_peer(room, channel, username):
+#       await redis.hset(f'room:{room}:peers', channel, username)
+#
+#   async def _remove_peer(room, channel):
+#       await redis.hdel(f'room:{room}:peers', channel)
+#
+#   async def _list_peers(room, exclude_channel=None):
+#       data = await redis.hgetall(f'room:{room}:peers')
+#       return [v.decode() for k, v in data.items()
+#               if k.decode() != exclude_channel]
+#
+# Then call these helpers in connect() / disconnect() instead of _rooms.
